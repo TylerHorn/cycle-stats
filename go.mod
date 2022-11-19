@@ -1,4 +1,4 @@
-module cycle-stats
+module cyclestats
 
 go 1.19
 

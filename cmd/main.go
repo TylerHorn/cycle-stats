@@ -7,7 +7,7 @@ import (
 	"time"
 
 	// TODO: import your plugins
-	//_ "github.com/TylerHorn/metadata/cycle-stats/aggregators/cycle-stats"
+	_ "github.com/TylerHorn/cyclestats/plugins/aggregators/cyclestats"
 
 	"github.com/influxdata/telegraf/plugins/common/shim"
 )
