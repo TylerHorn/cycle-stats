@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	// TODO: import your plugins
 	_ "github.com/TylerHorn/cyclestats/plugins/processors/cyclestats"
 
 	"github.com/influxdata/telegraf/plugins/common/shim"

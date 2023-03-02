@@ -1,4 +1,4 @@
-module github.com/TylerHorn/metadata
+module github.com/TylerHorn/cyclestats
 
 go 1.17
 

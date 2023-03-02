@@ -1,204 +1,255 @@
 package cyclestats
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
+	_ "embed"
 	"fmt"
-	"io"
-	"net/http"
 	"time"
 
 	"github.com/influxdata/telegraf"
-	"github.com/influxdata/telegraf/config"
+	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/plugins/processors"
 )
 
-type MetadataProcessor struct {
-	PortalTags          []string        `toml:"portal_tags"`
-	Timeout          config.Duration `toml:"timeout"`
-	Log              telegraf.Logger `toml:"-"`
-	ApiKey			 string `toml:"api_key"`
-	ApiUrl			 string `toml:"api_url"`
-	metaCache		 map[string]int
+var sampleConfig = ``
+
+type CycleStats struct {
+	Name    string          `toml:"name"`
+	GroupBy []string        `toml:"group_by"`
+	Log     telegraf.Logger `toml:"-"`
+	Fields  map[string][]string
+
+	cache   map[string][]telegraf.Metric
+	filters filter.Filter
 }
 
-
-type Response struct {
-	Id			  	int `json:"id"`
-	Cycle         	int `json:"cycle"`
-	DeviceConfig   	int `json:"device_config"`
-	GrindCycle		int `json:"grind_cycle"`
-	SteamCycle      int `json:"steam_cycle"`
-	WasteType      	string `json:"waste_type"`
-	Type        	string `json:"type"`
-	StartTime       string `json:"start_time"`
-	EndTime      	string `json:"end_time"`
-	Completed     	bool `json:"completed"`
-	Successful    	bool `json:"successful"`
+func (r *CycleStats) Description() string {
+	return "Aggregates cycle stats"
 }
 
-type Body struct {
-	Timestamp string `json:"timestamp"`
+func New() *CycleStats {
+	// Create object
+	cyclestats := CycleStats{}
+
+	// Setup defaults
+	cyclestats.Fields = make(map[string][]string)
+
+	cyclestats.Fields["steam_params"] = []string{
+		"steam_type",
+		"cook_temp",
+		"control_temp",
+		"hot_drain_temp",
+		"pv_unsafe",
+		"pv_too_low",
+		"drain_open_duration",
+		"drain_to_sec1",
+		"drain_to_sec2",
+		"wait_pressure",
+	}
+
+	cyclestats.Fields["steam_stats"] = []string{
+		"error",
+		"flows",
+		"pd_timeouts",
+		"stag_recoveries",
+		"stop_cook_count",
+	}
+
+	cyclestats.Fields["vessel_status"] = []string{
+		"lid_position",
+		"shroud_inside_up",
+		"shroud_inside_down",
+		"shroud_outside_up",
+		"shroud_outside_down",
+		"shrouds",
+		"vessel_temperature",
+		"heater_temperature",
+		"runaway_temperature",
+		"pv_sensor_type",
+		"vessel_pressure",
+		"seal_pressure",
+		"accumulator_pressure",
+		"top_cover",
+		"top_lid_open",
+		"top_lid_closed",
+		"bottom_lid_open",
+		"bottom_lid_closed",
+	}
+
+	cyclestats.Fields["steam_stats"] = []string{
+		"error",
+		"flows",
+		"pd_timeouts",
+		"stag_recoveries",
+		"stop_cook_count",
+	}
+
+	cyclestats.Fields["system_status"] = []string{
+		"cover_interlock",
+		"battery_fault",
+		"line_current",
+		"deodorizer_tank",
+		"oil_tank",
+		"flow_count",
+		"bag_door",
+		"top_cover",
+		"reservoir",
+		"fans",
+	}
+
+	cyclestats.Fields["sys_status_mngr"] = []string{
+		"heater",
+		"vacuum",
+		"water",
+		"compressor",
+	}
+
+	cyclestats.Fields["grinder"] = []string{
+		"grinder_state",
+		"jack_status",
+		"switches_bottom",
+		"switches_top",
+		"reversals",
+	}
+
+	cyclestats.Fields["vessel_lid_failure"] = []string{
+		"top_lid_open_failed",
+		"top_lid_close_failed",
+		"bottom_lid_open_failed",
+		"bottom_lid_close_failed",
+		"inside_shroud_open_failed",
+		"inside_shroud_close_failed",
+		"accumulator_not_pressurized",
+		"seals_vacuum_failed",
+		"jack_up_failed",
+		"close_seals_failed",
+		"vent_seals_failed",
+		"compressor_throttled",
+		"pv_mismatch",
+		"error",
+	}
+
+	cyclestats.GroupBy = []string{"*"}
+
+	// Initialize cache
+	cyclestats.Reset()
+
+	return &cyclestats
 }
 
-var meta_resp Response
-
-const sampleConfig = `
-  ## Available tags to attach to metrics:
-  ## * id
-  ## * cycle
-  ## * device_config
-  ## * grind_cycle
-  ## * steam_cycle
-  ## * waste_type
-  ## * type
-  ## * start_time
-  ## * end_time
-  ## * completed
-  ## * successful
-  portal_tags = [ "id", "grind_cycle", "steam_cycle" ]
-`
-
-const (
-	DefaultTimeout             = 10 * time.Second
-)
-
-func (r *MetadataProcessor) SampleConfig() string {
+func (*CycleStats) SampleConfig() string {
 	return sampleConfig
 }
 
-func (r *MetadataProcessor) Description() string {
-	return "Attach Portal metadata to metrics"
-}
-
-func (r *MetadataProcessor) Apply(in ...telegraf.Metric) []telegraf.Metric {
-	// Add metadata info for each metric
-	for _, metric := range in {
-		metric_type := metric.Name()
-		if (metric_type == "state_change") {
-			r.clearMetaCache()
-			metric.Drop()
-		}
-
-		if _, ok := r.metaCache["metadata"]; !ok {
-			tm := metric.Time().In(time.UTC)
-			if resp, err := r.getMetadata(tm, r.ApiKey, r.ApiUrl); err == nil {
-				meta_resp = resp
-			}
-		}
-
-		type TagType struct {
-			Tag			string
-			MetricType string
-		}
-
-		tagtype := TagType{MetricType: metric_type}
-
-		for _, tag := range r.PortalTags {
-			tagtype.Tag = tag
-			if v := r.metaCache[tag]; v != 0 {
-				switch tagtype {
-				case TagType{"steam_cycle", "steam"}:
-					metric.AddField(tag, v)
-				case TagType{"metadata", "steam"}:
-					metric.AddTag(tag, fmt.Sprint(v))
-				case TagType{"grind_cycle", "grind"}:
-					metric.AddField(tag, v)
-				case TagType{"metadata", "grind"}:
-					metric.AddTag(tag, fmt.Sprint(v))
-				case TagType{"metadata", "notification"}:
-					metric.AddField(tag, v)
-				}
-
-				// if (metric_type == "steam" && tag == "steam_cycle") {
-				// 	r.Log.Debugf("Adding field: %s with value: %d", tag, v)
-				// 	metric.AddField(tag, v)
-				// }
-				// if (metric_type == "grind" && tag == "grind_cycle") {
-				// 	r.Log.Debugf("Adding field: %s with value: %d", tag, v)
-				// 	metric.AddField(tag, v)
-				// }
-				// if (metric_type == "notification" && tag == "metadata" ) {
-				// 	r.Log.Debugf("Adding field: %s with value: %d", tag, v)
-				// 	metric.AddField(tag, v)
-				// }
-				// metric.AddTag(tag, fmt.Sprint(v))
-			}
-		}
-	}
-	return in
-}
-
-func (r *MetadataProcessor) Init() error {
-	r.Log.Info("Initializing Portal Metadata Processor")
-	if len(r.PortalTags) == 0 {
-		return errors.New("no tags specified in configuration")
-	}
+func (t *CycleStats) Init() error {
+	t.Log.Info("Initializing Portal CycleStats Processor")
 	return nil
 }
 
-func init() {
-	processors.Add("metadata", func() telegraf.Processor {
-		return &MetadataProcessor{
-			metaCache: make(map[string]int),
+
+func (t *CycleStats) Reset() {
+	t.cache = make(map[string][]telegraf.Metric)
+}
+
+func (t *CycleStats) generateGroupByKey(m telegraf.Metric) (string, error) {
+	// Create the filter.Filter objects if they have not been created
+	if t.filters == nil && len(t.GroupBy) > 0 {
+		var err error
+		t.filters, err = filter.Compile(t.GroupBy)
+		if err != nil {
+			return "", fmt.Errorf("could not compile pattern: %v %v", t.GroupBy, err)
 		}
+	}
+
+	groupkey := m.Name() + "&" + m.Time().Truncate(1000*time.Millisecond).String()
+
+	return groupkey, nil
+}
+
+func (t *CycleStats) groupBy(m telegraf.Metric) {
+	// Generate the metric group key
+	groupkey, err := t.generateGroupByKey(m)
+	if err != nil {
+		// If we could not generate the groupkey, fail hard
+		// by dropping this and all subsequent metrics
+		t.Log.Errorf("Could not generate group key: %v", err)
+		return
+	}
+
+	// Initialize the key with an empty list if necessary
+	if _, ok := t.cache[groupkey]; !ok {
+		t.cache[groupkey] = make([]telegraf.Metric, 0, 10)
+	}
+
+	// Append the metric to the corresponding key list
+	t.cache[groupkey] = append(t.cache[groupkey], m)
+}
+
+func (t *CycleStats) Apply(in ...telegraf.Metric) []telegraf.Metric {
+
+	groupkey := ""
+	// Add the metrics received to our internal cache
+	var measurment string
+	for _, m := range in {
+		measurment = m.Name()
+		// When tracking metrics this plugin could deadlock the input by
+		// holding undelivered metrics while the input waits for metrics to be
+		// delivered.  Instead, treat all handled metrics as delivered and
+		// produced metrics as untracked in a similar way to aggregators.
+		m.Drop()
+		gkey, _ := t.generateGroupByKey(m)
+		groupkey = gkey
+		// Check if the metric has any of the fields over which we are aggregating
+		hasField := false
+		for _, f := range t.Fields[m.Name()] {
+			if m.HasField(f) {
+				hasField = true
+				break
+			}
+		}
+		if !hasField {
+			continue
+		}
+
+		// Add the metric to the internal cache
+		t.groupBy(m)
+	}
+
+	if keyCount := len(t.cache[groupkey]); keyCount >= len(t.Fields[measurment]) {
+		return t.push()
+	}
+
+	return []telegraf.Metric{}
+}
+
+func (t *CycleStats) push() []telegraf.Metric {
+	// Generate aggregations list using the selected fields
+	aggs := make([]telegraf.Metric, 0)
+	for _, ms := range t.cache {
+		aggregate, _ := t.Aggregate(ms)
+		aggs = append(aggs, aggregate)
+	}
+
+	t.Reset()
+
+	return aggs
+}
+
+func (c *CycleStats) Aggregate(ms []telegraf.Metric) (telegraf.Metric, error) {
+	var metric telegraf.Metric
+	for _, m := range ms {
+		if metric == nil {
+			metric = m.Copy()
+		} else {
+			for _, field := range m.FieldList() {
+				metric.AddField(field.Key, field.Value)
+			}
+		}
+	}
+	return metric, nil
+}
+
+func init() {
+	processors.Add("cyclestats", func() telegraf.Processor {
+		return New()
 	})
-}
-
-func (r *MetadataProcessor) getMetadata(tm time.Time, apiKey string, apiUrl string) (Response, error) {
-	var token = fmt.Sprintf("TOKEN %s", apiKey)
-
-	jsonBody := []byte(fmt.Sprintf(`{"timestamp": "%s"}`, tm.Format("2006-01-02T15:04:05.000Z")))
-	bodyReader := bytes.NewReader(jsonBody)
-
-	client := http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	req, err := http.NewRequest(http.MethodPost, apiUrl, bodyReader)
-	if err != nil {
-		fmt.Println("Error creating request")
-	}
-	req.Header.Add("Authorization", token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return Response{}, fmt.Errorf("error during request: %w", err)
-	}
-    if resp.StatusCode >= 305 || resp.StatusCode <= 200 {
-        return Response{}, fmt.Errorf("unsuccessful status code: %s", resp.Status)
-    }
-
-
-	body, err := io.ReadAll(resp.Body) // response body is []byte
-	if err != nil {
-		return Response{}, fmt.Errorf("error while reading response body: %w", err)
-	}
-
-	defer resp.Body.Close()
-	var result Response
-
-	if err := json.Unmarshal(body, &result); err != nil {   // Parse []byte to go struct pointer
-		return Response{}, fmt.Errorf("error during request: %w", err)
-	}
-	r.setMetaCache(result)
-	return result, nil
-}
-
-func (r *MetadataProcessor) setMetaCache(resp Response) {
-	r.metaCache["metadata"] = resp.Id
-	r.metaCache["steam_cycle"] = resp.SteamCycle
-	r.metaCache["grind_cycle"] = resp.GrindCycle
-}
-
-func (r *MetadataProcessor) clearMetaCache() {
-	r.metaCache = make(map[string]int)
-}
-
-// PrettyPrint to print struct in a readable way
-func PrettyPrint(i interface{}) string {
-	s, _ := json.MarshalIndent(i, "", "\t")
-	return string(s)
 }
